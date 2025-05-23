@@ -1611,11 +1611,13 @@ check_gtfobins() {
     if grep -q "^$binary:$type:" "$GTFOBINS_DATA"; then
         echo -e "\n[+] $binary can be exploited via $type!"
         echo "    Exploit command:"
-        grep "^$binary:$type:" "$GTFOBINS_DATA" | cut -d: -f3
+        grep "^$binary:$type:" "$GTFOBINS_DATA" | cut -d: -f3-
+        echo "    Reference: https://gtfobins.github.io/gtfobins/$binary/"
         return 0
+    else
+        # Don't spam output with negative results
+        return 1
     fi
-
-    return 1
 }
 
 # ----------------------------------------------------------------------

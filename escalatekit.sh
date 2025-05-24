@@ -3758,85 +3758,89 @@ run_module() {
         ;;
     "recon")
         # Ask user about password knowledge before starting recon
-        if [ "$QUIET_MODE" = false ]; then
-            echo -e "\n\e[33m[!] RECONNAISSANCE MODULE PREPARATION\e[0m"
-            echo "====================================="
-            echo ""
-            echo "The reconnaissance module will perform comprehensive system analysis including:"
-            echo "• System information gathering"
-            echo "• Network configuration analysis"
-            echo "• Sudo privileges enumeration"
-            echo "• SUID binary detection"
-            echo "• File capabilities check"
-            echo "• Cron job analysis"
-            echo "• Writable files search"
-            echo "• Kernel vulnerability assessment"
-            echo ""
-            echo -e "\e[33m[?] IMPORTANT QUESTION:\e[0m"
-            echo "Do you know the current user's password for sudo enumeration?"
-            echo ""
-            echo "Options:"
-            echo "  y/yes - I know the password and will enter it when prompted"
-            echo "  n/no  - I don't know the password, skip password-protected checks"
-            echo "  a/auto - Try automatic detection without password prompts"
-            echo ""
+        if [ -z "$RECON_PASSWORD_AVAILABLE" ]; then
+            # This means we haven't set the password choice yet
+            if [ "$QUIET_MODE" = false ] && [ "$PARALLEL_MODE" = "" ]; then
+                # Only show interactive prompt in sequential mode
+                echo -e "\n\e[33m[!] RECONNAISSANCE MODULE PREPARATION\e[0m"
+                echo "====================================="
+                echo ""
+                echo "The reconnaissance module will perform comprehensive system analysis including:"
+                echo "• System information gathering"
+                echo "• Network configuration analysis"
+                echo "• Sudo privileges enumeration"
+                echo "• SUID binary detection"
+                echo "• File capabilities check"
+                echo "• Cron job analysis"
+                echo "• Writable files search"
+                echo "• Kernel vulnerability assessment"
+                echo ""
+                echo -e "\e[33m[?] IMPORTANT QUESTION:\e[0m"
+                echo "Do you know the current user's password for sudo enumeration?"
+                echo ""
+                echo "Options:"
+                echo "  y/yes - I know the password and will enter it when prompted"
+                echo "  n/no  - I don't know the password, skip password-protected checks"
+                echo "  a/auto - Try automatic detection without password prompts"
+                echo ""
 
-            while true; do
-                read -p "Enter your choice [y/n/a]: " password_choice
-                case "$password_choice" in
-                [Yy] | [Yy][Ee][Ss])
-                    export RECON_PASSWORD_AVAILABLE="yes"
-                    echo ""
-                    echo -e "\e[32m[+] Password will be requested during sudo enumeration\e[0m"
-                    echo -e "\e[33m[!] Be ready to enter the password when prompted\e[0m"
+                while true; do
+                    read -p "Enter your choice [y/n/a]: " password_choice
+                    case "$password_choice" in
+                    [Yy] | [Yy][Ee][Ss])
+                        export RECON_PASSWORD_AVAILABLE="yes"
+                        echo ""
+                        echo -e "\e[32m[+] Password will be requested during sudo enumeration\e[0m"
+                        echo -e "\e[33m[!] Be ready to enter the password when prompted\e[0m"
 
-                    # Prompt for password now and store it
-                    echo ""
-                    echo -e "\e[33m[*] Please enter the current user's password:\e[0m"
-                    read -s -p "Password: " user_password
-                    export RECON_USER_PASSWORD="$user_password"
-                    echo ""
-                    echo -e "\e[32m[+] Password stored for sudo enumeration\e[0m"
-                    break
-                    ;;
-                [Nn] | [Nn][Oo])
-                    export RECON_PASSWORD_AVAILABLE="no"
-                    export RECON_USER_PASSWORD=""
-                    echo ""
-                    echo -e "\e[33m[!] Password-protected sudo checks will be skipped\e[0m"
-                    echo -e "\e[32m[+] Only passwordless sudo access will be checked\e[0m"
-                    break
-                    ;;
-                [Aa] | [Aa][Uu][Tt][Oo])
-                    export RECON_PASSWORD_AVAILABLE="auto"
-                    export RECON_USER_PASSWORD=""
-                    echo ""
-                    echo -e "\e[32m[+] Automatic detection enabled\e[0m"
-                    echo -e "\e[33m[!] Will try cached credentials and passwordless access only\e[0m"
-                    break
-                    ;;
-                *)
-                    echo -e "\e[31m[-] Invalid choice. Please enter 'y', 'n', or 'a'\e[0m"
-                    ;;
-                esac
-            done
+                        # Prompt for password now and store it
+                        echo ""
+                        echo -e "\e[33m[*] Please enter the current user's password:\e[0m"
+                        read -s -p "Password: " user_password
+                        export RECON_USER_PASSWORD="$user_password"
+                        echo ""
+                        echo -e "\e[32m[+] Password stored for sudo enumeration\e[0m"
+                        break
+                        ;;
+                    [Nn] | [Nn][Oo])
+                        export RECON_PASSWORD_AVAILABLE="no"
+                        export RECON_USER_PASSWORD=""
+                        echo ""
+                        echo -e "\e[33m[!] Password-protected sudo checks will be skipped\e[0m"
+                        echo -e "\e[32m[+] Only passwordless sudo access will be checked\e[0m"
+                        break
+                        ;;
+                    [Aa] | [Aa][Uu][Tt][Oo])
+                        export RECON_PASSWORD_AVAILABLE="auto"
+                        export RECON_USER_PASSWORD=""
+                        echo ""
+                        echo -e "\e[32m[+] Automatic detection enabled\e[0m"
+                        echo -e "\e[33m[!] Will try cached credentials and passwordless access only\e[0m"
+                        break
+                        ;;
+                    *)
+                        echo -e "\e[31m[-] Invalid choice. Please enter 'y', 'n', or 'a'\e[0m"
+                        ;;
+                    esac
+                done
 
-            echo ""
-            echo -e "\e[33m[!] NOTICE:\e[0m Reconnaissance may take several minutes. Please be patient..."
-            echo ""
+                echo ""
+                echo -e "\e[33m[!] NOTICE:\e[0m Reconnaissance may take several minutes. Please be patient..."
+                echo ""
 
-            # Give user a moment to prepare
-            echo "Starting reconnaissance in 3 seconds..."
-            sleep 1
-            echo "2..."
-            sleep 1
-            echo "1..."
-            sleep 1
-            echo ""
-        else
-            # In quiet mode, default to auto detection
-            export RECON_PASSWORD_AVAILABLE="auto"
-            export RECON_USER_PASSWORD=""
+                # Give user a moment to prepare
+                echo "Starting reconnaissance in 3 seconds..."
+                sleep 1
+                echo "2..."
+                sleep 1
+                echo "1..."
+                sleep 1
+                echo ""
+            else
+                # In async mode or quiet mode, default to auto detection
+                export RECON_PASSWORD_AVAILABLE="auto"
+                export RECON_USER_PASSWORD=""
+            fi
         fi
 
         # Sequential execution with proper loading

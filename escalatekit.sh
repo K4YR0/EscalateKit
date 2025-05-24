@@ -1736,7 +1736,7 @@ exploit_suggest() {
     echo "" >>"$detailed_output"
 
     if [ ${#high_priority_vulns[@]} -gt 0 ]; then
-        echo "� HIGH PRIORITY (Immediate Exploitation):" >>"$output_file"
+        echo "🔴 HIGH PRIORITY (Immediate Exploitation):" >>"$output_file"
         echo "-------------------------------------------" >>"$output_file"
         for i in "${!high_priority_vulns[@]}"; do
             echo "$((i + 1)). ${high_priority_vulns[i]}" >>"$output_file"

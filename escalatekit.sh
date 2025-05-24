@@ -729,10 +729,6 @@ recon_suid_files() {
     # Clean up
     rm -f "/tmp/.suid_files.tmp"
 
-    if [ "$QUIET_MODE" = false ]; then
-        echo -e "\e[32m✓\e[0m Searching for SUID files... Done"
-    fi
-
     log_message "INFOS" "SUID files check saved to $output_file"
     return 0
 }
@@ -3745,6 +3741,66 @@ evade_cover_tracks() {
 # Main Execution Functions
 # ----------------------------------------------------------------------
 
+# Update the run_functions_parallel function for better thread support
+# Update the run_functions_parallel function for proper parallel execution
+run_functions_parallel() {
+    local mode="$1"
+    shift
+    local functions=("$@")
+    
+    case "$mode" in
+        "fork")
+            local pids=()
+            for func in "${functions[@]}"; do
+                $func &
+                pids+=($!)
+                if [ "$QUIET_MODE" = false ]; then
+                    echo "[*] Started $func in background (PID: $!)"
+                fi
+            done
+            # Wait for all functions to complete
+            for pid in "${pids[@]}"; do
+                wait $pid
+            done
+            ;;
+        "thread")
+            if command -v parallel >/dev/null 2>&1; then
+                # Export all necessary functions and variables for GNU Parallel
+                export -f $(declare -F | awk '{print $3}' | grep -E '^(recon_|persist_|exploit_|evade_|log_message|show_loading|check_gtfobins|init_gtfobins)' || true)
+                export LOG_DIR LOGFILE OUTPUT_DIR VERBOSE QUIET_MODE GTFOBINS_DATA
+                export RECON_PASSWORD_AVAILABLE RECON_USER_PASSWORD
+                
+                # Run functions in parallel with proper job control
+                printf '%s\n' "${functions[@]}" | parallel --will-cite -j0 --joblog /tmp/parallel.log 'eval {}'
+            else
+                log_message "WARN" "GNU Parallel not found, falling back to fork mode"
+                run_functions_parallel "fork" "${functions[@]}"
+            fi
+            ;;
+        "subshell")
+            # Fixed: Run subshells in parallel, not sequentially
+            local pids=()
+            for func in "${functions[@]}"; do
+                if [ "$QUIET_MODE" = false ]; then
+                    echo "[*] Running $func in subshell..."
+                fi
+                ( $func ) &
+                pids+=($!)
+            done
+            # Wait for all subshells to complete
+            for pid in "${pids[@]}"; do
+                wait $pid
+            done
+            ;;
+        *)
+            # Sequential execution
+            for func in "${functions[@]}"; do
+                $func
+            done
+            ;;
+    esac
+}
+
 # SIMPLIFIED run_module function
 run_module() {
     local module="$1"
@@ -3843,132 +3899,188 @@ run_module() {
             fi
         fi
 
-        # Sequential execution with proper loading
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Gathering system information..."
-        fi
-        recon_system_info &
-        show_loading $! "Gathering system information"
-        wait $!
+        # Define recon functions to run
+        recon_functions=(
+            "recon_system_info"
+            "recon_network"
+            "recon_sudo_privileges"
+            "recon_suid_files"
+            "recon_capabilities"
+            "recon_cron_jobs"
+            "recon_writable_files"
+            "recon_kernel_exploits"
+        )
 
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Analyzing network configuration..."
-        fi
-        recon_network &
-        show_loading $! "Analyzing network configuration"
-        wait $!
+        # Run recon functions based on parallel mode
+        if [ -n "$PARALLEL_MODE" ]; then
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Running reconnaissance functions in $PARALLEL_MODE mode..."
+            fi
+            run_functions_parallel "$PARALLEL_MODE" "${recon_functions[@]}"
+        else
 
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Checking sudo privileges..."
-        fi
-        recon_sudo_privileges &
-        show_loading $! "Checking sudo privileges"
-        wait $!
+            # Sequential execution with proper loading
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Gathering system information..."
+            fi
+            recon_system_info &
+            show_loading $! "Gathering system information"
+            wait $!
 
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Searching for SUID files (this may take a while)..."
-        fi
-        recon_suid_files &
-        show_loading $! "Searching for SUID files"
-        wait $!
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Analyzing network configuration..."
+            fi
+            recon_network &
+            show_loading $! "Analyzing network configuration"
+            wait $!
 
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Checking capabilities..."
-        fi
-        recon_capabilities &
-        show_loading $! "Checking capabilities"
-        wait $!
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Checking sudo privileges..."
+            fi
+            recon_sudo_privileges &
+            show_loading $! "Checking sudo privileges"
+            wait $!
 
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Analyzing cron jobs..."
-        fi
-        recon_cron_jobs &
-        show_loading $! "Analyzing cron jobs"
-        wait $!
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Searching for SUID files (this may take a while)..."
+            fi
+            recon_suid_files &
+            show_loading $! "Searching for SUID files"
+            wait $!
 
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Searching for writable files (this may take a while)..."
-        fi
-        recon_writable_files &
-        show_loading $! "Searching for writable files"
-        wait $!
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Checking capabilities..."
+            fi
+            recon_capabilities &
+            show_loading $! "Checking capabilities"
+            wait $!
 
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Checking for kernel exploits..."
-        fi
-        recon_kernel_exploits &
-        show_loading $! "Checking for kernel exploits"
-        wait $!
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Analyzing cron jobs..."
+            fi
+            recon_cron_jobs &
+            show_loading $! "Analyzing cron jobs"
+            wait $!
 
-        # Clear the stored password for security
-        unset RECON_USER_PASSWORD
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Searching for writable files (this may take a while)..."
+            fi
+            recon_writable_files &
+            show_loading $! "Searching for writable files"
+            wait $!
+
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Checking for kernel exploits..."
+            fi
+            recon_kernel_exploits &
+            show_loading $! "Checking for kernel exploits"
+            wait $!
+
+            # Clear the stored password for security
+            unset RECON_USER_PASSWORD
+
+        fi
         ;;
-    # ...existing code for other modules...
     "exploit")
-        if [ "$QUIET_MODE" = false ]; then
-            echo -e "\n[*] Analyzing exploitation paths..."
-        fi
-        exploit_suggest &
-        show_loading $! "Analyzing exploitation paths"
-        wait $!
 
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Generating exploit templates..."
+        exploit_functions=(
+            "exploit_suggest"
+            "exploit_generate_templates"
+        )
+
+        if [ -n "$PARALLEL_MODE" ]; then
+            run_functions_parallel "$PARALLEL_MODE" "${exploit_functions[@]}"
+        else
+
+            if [ "$QUIET_MODE" = false ]; then
+                echo -e "\n[*] Analyzing exploitation paths..."
+            fi
+            exploit_suggest &
+            show_loading $! "Analyzing exploitation paths"
+            wait $!
+
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Generating exploit templates..."
+            fi
+            exploit_generate_templates &
+            show_loading $! "Generating exploit templates"
+            wait $!
+
         fi
-        exploit_generate_templates &
-        show_loading $! "Generating exploit templates"
-        wait $!
         ;;
     "persist")
-        if [ "$QUIET_MODE" = false ]; then
-            echo -e "\n[*] Setting up SSH key persistence..."
-        fi
-        persist_ssh_key &
-        show_loading $! "Setting up SSH key persistence"
-        wait $!
 
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Setting up cron job persistence..."
-        fi
-        persist_cron_job &
-        show_loading $! "Setting up cron job persistence"
-        wait $!
+        persist_functions=(
+            "persist_ssh_key"
+            "persist_cron_job"
+            "persist_systemd_service"
+            "persist_startup_file"
+        )
 
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Setting up systemd service persistence..."
-        fi
-        persist_systemd_service &
-        show_loading $! "Setting up systemd service persistence"
-        wait $!
+        if [ -n "$PARALLEL_MODE" ]; then
+            run_functions_parallel "$PARALLEL_MODE" "${persist_functions[@]}"
+        else
+            if [ "$QUIET_MODE" = false ]; then
+                echo -e "\n[*] Setting up SSH key persistence..."
+            fi
+            persist_ssh_key &
+            show_loading $! "Setting up SSH key persistence"
+            wait $!
 
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Setting up startup file persistence..."
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Setting up cron job persistence..."
+            fi
+            persist_cron_job &
+            show_loading $! "Setting up cron job persistence"
+            wait $!
+
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Setting up systemd service persistence..."
+            fi
+            persist_systemd_service &
+            show_loading $! "Setting up systemd service persistence"
+            wait $!
+
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Setting up startup file persistence..."
+            fi
+            persist_startup_file &
+            show_loading $! "Setting up startup file persistence"
+            wait $!
         fi
-        persist_startup_file &
-        show_loading $! "Setting up startup file persistence"
-        wait $!
         ;;
+
     "evade")
-        if [ "$QUIET_MODE" = false ]; then
-            echo -e "\n[*] Setting up log cleanup capabilities..."
-        fi
-        evade_cleanup_logs &
-        show_loading $! "Setting up log cleanup capabilities"
-        wait $!
+        evade_functions=(
+            "evade_cleanup_logs"
+            "evade_timestomp"
+            "evade_cover_tracks"
+        )
 
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Setting up timestomping capabilities..."
-        fi
-        evade_timestomp &
-        show_loading $! "Setting up timestomping capabilities"
-        wait $!
+        if [ -n "$PARALLEL_MODE" ]; then
+            run_functions_parallel "$PARALLEL_MODE" "${evade_functions[@]}"
+        else
+            if [ "$QUIET_MODE" = false ]; then
+                echo -e "\n[*] Setting up log cleanup capabilities..."
+            fi
+            evade_cleanup_logs &
+            show_loading $! "Setting up log cleanup capabilities"
+            wait $!
 
-        if [ "$QUIET_MODE" = false ]; then
-            echo "[*] Setting up track covering capabilities..."
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Setting up timestomping capabilities..."
+            fi
+            evade_timestomp &
+            show_loading $! "Setting up timestomping capabilities"
+            wait $!
+
+            if [ "$QUIET_MODE" = false ]; then
+                echo "[*] Setting up track covering capabilities..."
+            fi
+            evade_cover_tracks &
+            show_loading $! "Setting up track covering capabilities"
+            wait $!
         fi
-        evade_cover_tracks &
-        show_loading $! "Setting up track covering capabilities"
-        wait $!
         ;;
     *)
         log_message "ERROR" "Unknown module: $module"
@@ -4002,81 +4114,50 @@ run_with_fork() {
 }
 
 # Run modules using threads
+
 run_with_thread() {
     local modules=("$@")
 
     log_message "INFOS" "Running modules using threads"
 
-    # Since Bash doesn't natively support threads, we use GNU Parallel if available
     if command -v parallel >/dev/null 2>&1; then
-        # Create a temporary script for parallel execution
-        cat >/tmp/escalatekit_parallel.sh <<'EOF'
-#!/bin/bash
-MODULE=$1
-
-case "$MODULE" in
-    "shell")
-        shell_upgrade
-        ;;
-    "recon")
-        recon_system_info
-        recon_network
-        recon_sudo_privileges
-        recon_suid_files
-        recon_capabilities
-        recon_cron_jobs
-        recon_writable_files
-        recon_kernel_exploits
-        ;;
-    "exploit")
-        exploit_suggest
-        exploit_generate_templates
-        ;;
-    "persist")
-        persist_ssh_key
-        persist_cron_job
-        persist_systemd_service
-        persist_startup_file
-        ;;
-    "evade")
-        evade_cleanup_logs
-        evade_timestomp
-        evade_cover_tracks
-        ;;
-    *)
-        echo "Unknown module: $MODULE" >&2
-        exit 1
-        ;;
-esac
-EOF
-        chmod +x /tmp/escalatekit_parallel.sh
-
-        # Execute in parallel
-        parallel --will-cite -j0 /tmp/escalatekit_parallel.sh ::: "${modules[@]}"
-
-        # Clean up
-        rm -f /tmp/escalatekit_parallel.sh
+        # Export all necessary functions and variables more comprehensively
+        export -f $(declare -F | awk '{print $3}')
+        
+        # Export all variables
+        export LOG_DIR LOGFILE OUTPUT_DIR VERBOSE QUIET_MODE GTFOBINS_DATA
+        export RECON_PASSWORD_AVAILABLE RECON_USER_PASSWORD
+        export DEFAULT_OUTPUT_DIR PROGRAM_NAME VERSION
+        
+        # Run modules in parallel with better job control
+        printf '%s\n' "${modules[@]}" | parallel --will-cite -j0 --delay 0.1 run_module
     else
-        # Fallback to fork if GNU Parallel is not available
         log_message "WARN" "GNU Parallel not found, falling back to fork mode"
         run_with_fork "${modules[@]}"
     fi
 
     log_message "INFOS" "All modules completed using threads"
 }
-
 # Run modules using subshell
 run_with_subshell() {
     local modules=("$@")
 
     log_message "INFOS" "Running modules using subshell"
 
+    # Fixed: Run modules in parallel subshells, not sequential
+    local pids=()
     for module in "${modules[@]}"; do
         (
             log_message "INFOS" "Starting module $module in subshell"
             run_module "$module"
             log_message "INFOS" "Completed module $module in subshell"
-        )
+        ) &
+        pids+=($!)
+    done
+    
+    # Wait for all subshells to complete
+    for pid in "${pids[@]}"; do
+        wait $pid
     done
 
     log_message "INFOS" "All modules completed using subshell"

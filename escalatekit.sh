@@ -8,7 +8,9 @@
 # ----------------------------------------------------------------------
 PROGRAM_NAME=$(basename "$0")
 VERSION="1.0"
-LOG_DIR="/tmp/.escalatekit_logs"
+DEFAULT_LOG_DIR="/var/log/escalatekit"
+FALLBACK_LOG_DIR="/tmp/.escalatekit_logs"
+LOG_DIR=""
 DEFAULT_OUTPUT_DIR="/tmp/.escalatekit_results"
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 LOGFILE="$LOG_DIR/history.log"
@@ -56,6 +58,50 @@ show_loading() {
     fi
 }
 
+# Function to initialize log directory with fallback
+init_log_directory() {
+    local primary_log_dir="$DEFAULT_LOG_DIR"
+    local fallback_log_dir="$FALLBACK_LOG_DIR"
+    
+    # Try primary log directory first
+    if mkdir -p "$primary_log_dir" 2>/dev/null && [ -w "$primary_log_dir" ]; then
+        LOG_DIR="$primary_log_dir"
+        LOGFILE="$LOG_DIR/history.log"
+        if [ "$QUIET_MODE" = false ]; then
+            echo -e "\e[32m[+] Using primary log directory: $LOG_DIR\e[0m"
+        fi
+        return 0
+    fi
+    
+    # Primary failed, try with sudo if available
+    if command -v sudo >/dev/null 2>&1 && sudo -n mkdir -p "$primary_log_dir" 2>/dev/null && sudo -n chown "$(whoami)" "$primary_log_dir" 2>/dev/null; then
+        LOG_DIR="$primary_log_dir"
+        LOGFILE="$LOG_DIR/history.log"
+        if [ "$QUIET_MODE" = false ]; then
+            echo -e "\e[33m[+] Created primary log directory with sudo: $LOG_DIR\e[0m"
+        fi
+        return 0
+    fi
+    
+    # Fall back to temporary directory
+    if mkdir -p "$fallback_log_dir" 2>/dev/null; then
+        LOG_DIR="$fallback_log_dir"
+        LOGFILE="$LOG_DIR/history.log"
+        if [ "$QUIET_MODE" = false ]; then
+            echo -e "\e[32m[+] Primary log directory: $primary_log_dir\e[0m"
+            echo -e "\e[33m[!] Primary log directory not accessible, using fallback: $LOG_DIR\e[0m"
+        fi
+        return 0
+    fi
+    
+    # If both fail, show error
+    echo -e "\e[31m[-] Error: Cannot create log directory in either location\e[0m" >&2
+    echo -e "\e[31m    Primary: $primary_log_dir\e[0m" >&2
+    echo -e "\e[31m    Fallback: $fallback_log_dir\e[0m" >&2
+    return 1
+}
+
+
 # Function to log messages to both console and log file
 log_message() {
     local level="$1"
@@ -65,17 +111,32 @@ log_message() {
     local username
     username=$(whoami)
 
-    # Create the log directory if it doesn't exist
-    if [ ! -d "$LOG_DIR" ]; then
-        mkdir -p "$LOG_DIR" 2>/dev/null
+    # Ensure log directory exists
+    if [ -z "$LOG_DIR" ] || [ ! -d "$LOG_DIR" ]; then
+        init_log_directory
         if [ $? -ne 0 ]; then
-            echo "Cannot create log directory: $LOG_DIR" >&2
+            # If we can't create log directory, just output to console
+            if [ "$QUIET_MODE" = false ]; then
+                if [ "$level" = "ERROR" ]; then
+                    echo -e "\e[31m[ERROR]\e[0m $message" >&2
+                elif [ "$level" = "WARN" ]; then
+                    echo -e "\e[33m[WARN]\e[0m $message"
+                elif [ "$level" = "INFOS" ]; then
+                    if [ "$VERBOSE" = true ]; then
+                        echo -e "\e[32m[INFO]\e[0m $message"
+                    fi
+                else
+                    echo "$message"
+                fi
+            fi
             return 1
         fi
     fi
 
-    # Log to file
-    echo "$timestamp : $username : $level : $message" >>"$LOGFILE"
+    # Log to file if we have a valid log directory
+    if [ -n "$LOGFILE" ] && [ -d "$LOG_DIR" ]; then
+        echo "$timestamp : $username : $level : $message" >>"$LOGFILE" 2>/dev/null
+    fi
 
     # Display to console if not in quiet mode - with improved formatting
     if [ "$QUIET_MODE" = false ]; then
@@ -4621,8 +4682,17 @@ while [[ $# -gt 0 ]]; do
             log_message "ERROR" "Option -l requires a directory parameter"
             exit $E_MISSING_PARAM
         fi
+        # Set custom log directory (overrides auto-detection)
         LOG_DIR="$2"
         LOGFILE="$LOG_DIR/history.log"
+        # Try to create the custom log directory
+        if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
+            echo -e "\e[31m[-] Error: Cannot create custom log directory: $LOG_DIR\e[0m" >&2
+            exit $E_PERMISSION_DENIED
+        fi
+        if [ "$QUIET_MODE" = false ]; then
+            echo -e "\e[32m[+] Using custom log directory: $LOG_DIR\e[0m"
+        fi
         shift 2
         ;;
     -r | --restore)
@@ -4678,20 +4748,6 @@ if [ "$QUIET_MODE" = false ]; then
     echo -e "\e[0m"
     echo -e "\e[1;32mPost-Exploitation Automation Tool v$VERSION\e[0m"
     echo -e "\e[1;34mAuthor: K4YR0\e[0m"
-
-    # Show current user status instead of root status
-    current_user=$(whoami)
-    current_uid=$(id -u)
-
-    if [ "$current_uid" -eq 0 ]; then
-        echo -e "\e[1;33m[!] Currently running as ROOT - privilege escalation not needed\e[0m"
-    else
-        echo -e "\e[1;32m[+] Running as user: $current_user (UID: $current_uid) - ready for privilege escalation\e[0m"
-    fi
-
-    echo -e "\e[0m"
-    echo "========================================================================"
-    echo ""
 fi
 
 # Check current privileges (this will respect the QUIET_MODE setting)
@@ -4704,11 +4760,23 @@ if [ $? -ne 0 ]; then
     exit $E_PERMISSION_DENIED
 fi
 
-# Create log directory if it doesn't exist
-mkdir -p "$LOG_DIR" 2>/dev/null
-if [ $? -ne 0 ]; then
-    log_message "ERROR" "Cannot create log directory: $LOG_DIR"
-    exit $E_PERMISSION_DENIED
+# Initialize log directory if not already set by -l option
+if [ -z "$LOG_DIR" ]; then
+    init_log_directory
+    if [ $? -ne 0 ]; then
+        echo -e "\e[31m[-] Fatal: Cannot initialize logging system\e[0m" >&2
+        exit $E_PERMISSION_DENIED
+    fi
+fi
+
+# Display log location
+if [ "$QUIET_MODE" = false ]; then
+    
+     # Display log file location
+    echo -e "\e[1;36m[*] Log file location: $LOGFILE\e[0m"
+    echo -e "\e[0m"
+    echo "========================================================================"
+    echo ""
 fi
 
 # Parse modules to run

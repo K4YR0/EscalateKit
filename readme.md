@@ -41,14 +41,14 @@ A comprehensive **privilege escalation** and **post-exploitation** tool for Linu
 ## 🛠 Installation
 ### Method 1: Direct Download
 ```bash
-curl -sL https://raw.githubusercontent.com/ZakariyaeBelagraa/EscalateKit/main/escalatekit.sh -o escalatekit.sh
+curl -sL https://raw.githubusercontent.com/K4YR0/EscalateKit/main/escalatekit.sh -o escalatekit.sh
 chmod +x escalatekit.sh
 sudo ./escalatekit.sh
 ```
 
 ### Method 2: Clone Repository
 ```bash
-git clone https://github.com/ZakariyaeBelagraa/EscalateKit.git
+git clone https://github.com/K4YR0/EscalateKit.git
 cd EscalateKit
 chmod +x escalatekit.sh
 sudo ./escalatekit.sh
